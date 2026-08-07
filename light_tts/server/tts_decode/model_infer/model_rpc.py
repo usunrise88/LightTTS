@@ -43,7 +43,10 @@ class TTS2DecodeModelRpcServer:
         if load_jit:
             self.model.load_jit("{}/flow.encoder.{}.zip".format(model_dir, "fp16" if self.fp16 is True else "fp32"))
         if load_trt:
-            capability = torch.cuda.get_device_capability(0)
+            # 必须用本进程实际使用的 gpu_id，而不是写死的 0：decode 进程按
+            # decode_proc_index % gpu_num 分布到不同卡上，混合架构机器上写死 0 会
+            # 生成/加载错误算力版本的 trt plan。
+            capability = torch.cuda.get_device_capability(gpu_id)
             self.model.load_trt(
                 "{}/flow.decoder.estimator.{}.sm{}{}.plan".format(
                     model_dir, "fp16" if self.fp16 is True else "fp32", capability[0], capability[1]

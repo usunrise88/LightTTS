@@ -246,9 +246,14 @@ class RouterManager:
             def get_new_batch():
                 limit_router_queue_length = None
 
-                self.overlap_event.wait(timeout=0.020)
-                self.overlap_event.clear()
-                time.sleep(0.003)
+                # overlap_event 只在 _prefill_batch / _decode_batch 发起 forward 前被 set，
+                # 这里等待的目的是让调度(CPU)与正在进行的 forward(GPU)重叠。
+                # running_batch 为 None 时没有任何 forward 在跑，event 不会被 set，
+                # 等待只会白白耗满 20ms 超时再加 3ms，纯粹增加空闲时的首包延迟。
+                if running_batch is not None:
+                    self.overlap_event.wait(timeout=0.020)
+                    self.overlap_event.clear()
+                    time.sleep(0.003)
                 new_batch = self.req_queue.generate_new_batch(running_batch, limit_router_queue_length)
                 return new_batch
 

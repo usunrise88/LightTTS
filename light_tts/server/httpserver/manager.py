@@ -113,20 +113,22 @@ class HttpServerManager:
                 await self.abort(request_id)
                 raise Exception(f"req_id {request_id} disconnected")
 
+            # 只在锁内把待发送数据整体取走，yield 必须放到锁外面。
+            # 否则锁会一直被持有到客户端 socket 写完为止，而 handle_loop 给任何请求
+            # 追加音频时都要抢同一把锁，导致一个慢客户端阻塞住所有并发请求的音频下发。
             async with req_status.lock:
                 event.clear()
-                logger.info(
-                    f"req_id {request_id} get out data, len(out_data_info_list) {len(req_status.out_data_info_list)}"
-                )
                 if len(req_status.out_data_info_list) == 0:
                     continue
+                pending = req_status.out_data_info_list
+                req_status.out_data_info_list = []
 
-                for tts_speech, finish_status, finialize in req_status.out_data_info_list:
-                    logger.debug(f"req_id {request_id} yield data {tts_speech.shape}")
-                    yield tts_speech, finish_status, finialize
-                    if finialize:
-                        return
-                req_status.out_data_info_list.clear()
+            logger.info(f"req_id {request_id} get out data, len(out_data_info_list) {len(pending)}")
+            for tts_speech, finish_status, finialize in pending:
+                logger.debug(f"req_id {request_id} yield data {tts_speech.shape}")
+                yield tts_speech, finish_status, finialize
+                if finialize:
+                    return
 
     async def _log_req_header(self, request_headers, group_request_id: int):
 
@@ -157,7 +159,16 @@ class HttpServerManager:
         if sampling_params.max_new_tokens < sampling_params.min_new_tokens:
             raise ValueError("The input is too long and the resulting audio will be incomplete")
 
-    async def generate(self, request_dict, request_id, sampling_params, request=None):
+    async def _submit(
+        self, request_dict, request_id, sampling_params, request=None, wait_for_slot: bool = True
+    ) -> Optional["ReqStatus"]:
+        """把请求送入 encode 流水线并返回其 ReqStatus，不消费任何结果。
+
+        与结果消费分离，是为了让调用方能先把一段文本切出来的多个句子一起提交，
+        使 encode / llm / decode 三级流水线真正并行起来。
+
+        wait_for_slot 为 False 时，如果没有空闲 shm 槽位就返回 None 而不是阻塞等待。
+        """
         # 记录请求到达的相关信息
         start_time = time.time()
         try:
@@ -181,6 +192,9 @@ class HttpServerManager:
                 sampling_params.max_new_tokens = len(text_ids) * self.max_token_text_ratio
 
             req_index = await self.shm_req_manager.async_alloc_req_index()
+            if req_index is None and not wait_for_slot:
+                # 机会性提交：没有空闲 shm 槽位就直接放弃，由调用方稍后重试
+                return None
             while req_index is None:
                 await asyncio.sleep(0.1)
                 req_index = await self.shm_req_manager.async_alloc_req_index()
@@ -194,7 +208,16 @@ class HttpServerManager:
             self.req_id_to_out_inf[request_id] = req_status
 
             await self.transfer_to_next_module(style_name, req_status.group_req_objs)
+            return req_status
 
+        except Exception as e:
+            logger.error(f"request_id: {request_id} has exception {str(e)}")
+            await self.abort(request_id)
+            raise e
+
+    async def stream_results(self, request_id, req_status: "ReqStatus", request=None):
+        """消费一个已经通过 _submit 提交的请求的音频结果。"""
+        try:
             results_generator = self._wait_to_token_package(
                 request_id,
                 req_status,
@@ -208,6 +231,68 @@ class HttpServerManager:
             logger.error(f"request_id: {request_id} has exception {str(e)}")
             await self.abort(request_id)
             raise e
+        return
+
+    async def generate(self, request_dict, request_id, sampling_params, request=None):
+        req_status = await self._submit(request_dict, request_id, sampling_params, request)
+        async for out in self.stream_results(request_id, req_status, request):
+            yield out
+        return
+
+    async def generate_pipelined(self, request_dicts, request_ids, sampling_params, request=None):
+        """按顺序产出多个句子的音频，同时保持多个句子并行处于流水线中。
+
+        原本的写法是把每个句子的 generate() 生成器存进列表后依次消费，而 async generator
+        的函数体要到第一次 __anext__ 才执行，所以第 N+1 句要等第 N 句全部播完才被提交，
+        句子之间完全没有并行，GPU 在句子切换时是空闲的。
+
+        这里用一个滑动窗口：最多同时提交 window 个句子。除第一句外都是"机会性"提交，
+        拿不到空闲 shm 槽位就放弃、等下一轮再试。这一点很关键：如果每句都阻塞等槽位，
+        多个并发请求可能各自占着几个槽位又都在等下一个槽位，而非流式请求要等调用方读取
+        之后才会被回收，于是谁也无法推进 —— 直接死锁。只让第一句阻塞等待，就能保证每个
+        请求至少持有一个槽位并且一定能往前走。
+        """
+        # 三级流水线，窗口取 4 已足够打满；再受 shm 槽位数一半的约束，避免独占所有槽位。
+        window = max(1, min(4, self.args.running_max_req_size // 2))
+        pending: List[Tuple[int, "ReqStatus"]] = []
+        next_to_submit = 0
+        total = len(request_dicts)
+
+        async def try_submit(wait_for_slot: bool) -> bool:
+            nonlocal next_to_submit
+            if next_to_submit >= total:
+                return False
+            i = next_to_submit
+            req_status = await self._submit(
+                request_dicts[i], request_ids[i], sampling_params, request, wait_for_slot=wait_for_slot
+            )
+            if req_status is None:
+                return False
+            next_to_submit += 1
+            pending.append((request_ids[i], req_status))
+            return True
+
+        try:
+            # 第一句阻塞等待槽位，保证本请求一定能推进
+            await try_submit(wait_for_slot=True)
+            while len(pending) < window and await try_submit(wait_for_slot=False):
+                pass
+
+            while pending:
+                req_id, req_status = pending.pop(0)
+                async for out in self.stream_results(req_id, req_status, request):
+                    yield out
+                while len(pending) < window and await try_submit(wait_for_slot=False):
+                    pass
+                # 槽位紧张导致一句都没提交出去，且已无在途请求时必须阻塞等待，
+                # 否则剩余句子永远发不出去。此时本请求不持有任何槽位，不会死锁。
+                if not pending and next_to_submit < total:
+                    await try_submit(wait_for_slot=True)
+        except Exception:
+            # 已经提交但还没被消费的句子必须显式 abort，否则会泄漏 shm 槽位
+            for req_id, _ in pending:
+                await self.abort(req_id)
+            raise
         return
 
     async def abort(self, request_id):

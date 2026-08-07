@@ -300,11 +300,11 @@ async def inference_zero_shot(
     prompt_wav.file.seek(0)
     speech_md5 = calculate_md5(prompt_wav.file)
 
-    generate_objs = []
     need_extract_speech = True
     speech_index, have_alloc = g_objs.httpserver_manager.alloc_speech_mem(speech_md5, prompt_speech_16k)
 
     request_ids = []
+    req_dicts = []
     for text in tts_texts:
         cur_req_dict = {
             "text": text,
@@ -318,14 +318,14 @@ async def inference_zero_shot(
             "speed": speed,
         }
         need_extract_speech = False
-        request_id = g_id_gen.generate_id()
-        results_generator = g_objs.httpserver_manager.generate(
-            cur_req_dict, request_id, sampling_params, request=request
-        )
-        generate_objs.append(results_generator)
-        request_ids.append(request_id)
+        req_dicts.append(cur_req_dict)
+        request_ids.append(g_id_gen.generate_id())
 
-    print(f"split to request_ids: {request_ids}")
+    logger.info(f"split to request_ids: {request_ids}")
+    # 用滑动窗口把多个句子并行送入流水线，结果仍按句子顺序产出
+    generate_objs = [
+        g_objs.httpserver_manager.generate_pipelined(req_dicts, request_ids, sampling_params, request=request)
+    ]
     if stream:
         try:
             return StreamingResponse(generate_data_stream(generate_objs))

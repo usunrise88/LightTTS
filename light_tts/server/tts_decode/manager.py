@@ -115,6 +115,13 @@ class TTSDecodeManager:
             else:
                 while len(self.waiting_reqs) > 0:
                     batch: List[DecodeReq] = self.get_batch()
+                    # get_batch 在所有等待请求的输出队列都满时会返回空 batch，此时必须让出事件循环，
+                    # 等待 httpserver 消费音频后再继续。否则这里会变成一个不含 await 的死循环：
+                    # CPU 空转 100%、向 httpserver 疯狂发送 None、并且 batch[0] 抛 IndexError 刷屏，
+                    # 同时 handle_loop 被饿死收不到 tts_llm 的新 token。
+                    if len(batch) == 0:
+                        await asyncio.sleep(0.01)  # 10ms
+                        continue
                     try:
                         await self.infer_decodec_batch(batch)
                         self.send_to_httpserver.send_pyobj(None, protocol=pickle.HIGHEST_PROTOCOL)

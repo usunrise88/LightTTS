@@ -105,10 +105,15 @@ class TTS1EncodeManager:
             else:
                 idle_count = 1000
                 n = len(self.waiting_reqs)
+                # 记录本轮是否真正处理掉了请求，全部因为音色数据未就绪而重新入队时需要让出事件循环，
+                # 否则外层 while True 会立刻以相同的 n 再跑一轮，形成不含 await 的 CPU 空转，
+                # 并且 loop_for_netio_req 会被饿死收不到新请求。
+                made_progress = False
                 while n > 0:
                     req = self.waiting_reqs.pop(0)
                     if req.is_aborted:
                         n -= 1
+                        made_progress = True
                         req.router_aborted = True
                         self.shm_req_manager.put_back_req_obj(req)
                         req.can_released_mark = True
@@ -155,8 +160,13 @@ class TTS1EncodeManager:
                     )
                     self.shm_req_manager.put_back_req_obj(req)
                     self.send_to_tts_llms[style_name].send_pyobj(req.index_in_shm_mem)
+                    made_progress = True
                     cost_time = (time.time() - req.start_time) * 1000
                     logger.info(f"module {module_name} req_id {req.request_id} cost_time {cost_time} ms")
+
+                if not made_progress:
+                    # 本轮所有请求都在等待其他 encode 进程写入音色数据，退避 10ms 再重试
+                    await asyncio.sleep(0.01)  # 10ms
 
     async def loop_for_netio_req(self):
         while True:
