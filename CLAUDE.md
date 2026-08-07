@@ -124,7 +124,11 @@ decode semaphores are allocated but never taken.
 
 Audio leaves the server as raw `int16` PCM at 24 kHz with **no WAV header** (`api_http.py:161`); clients add
 it themselves. Long text is split into sentences by `text_normalize(split=True)`, and **each sentence
-becomes its own request_id** whose generators are concatenated in the response.
+becomes its own request_id**. `HttpServerManager.generate_pipelined` drives them through a bounded sliding
+window so several sentences are in the pipeline at once while results are still yielded in sentence order;
+submission (`_submit`) is deliberately separate from consumption (`stream_results`) to make that possible.
+Every sentence after the first takes its shm slot opportunistically — do not make that acquisition blocking,
+or concurrent multi-sentence requests will deadlock holding slots that only free on consumption.
 
 ### Shared memory is the real IPC channel
 
